@@ -1,6 +1,6 @@
 
-file_path=/data/dongwan/Search-R1_data
-export HF_HOME=$file_path/.cache/huggingface
+file_path=/shared/datasets/search-r1
+export HF_HOME=/shared/models/hf-dial
 index_file=$file_path/e5_Flat.index
 corpus_file=$file_path/wiki-18.jsonl
 retriever_name=e5

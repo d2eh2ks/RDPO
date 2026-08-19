@@ -79,6 +79,8 @@ class RewardManager():
                  div_lambda_map=None,
                  div_lambda_default=1.0 / 3.0,
                  div_off_all_correct=False,
+                 div_gold_only=False,
+                 div_gold_watch=False,
                  use_format_reward=True,
                  bleu_sigma=0.65,
                  guesser_gate=True,
@@ -174,6 +176,24 @@ class RewardManager():
         # toward whichever already-correct rollout happened to be most novel, which is
         # a plausible pass@1 leak. Off by default.
         self.div_off_all_correct = bool(div_off_all_correct)
+        # GOLD-ONLY NUMERATOR (diversity_type='budget'):
+        #     R_div_i = (1/|D_i|) Σ_{d ∈ D_i ∩ GoldBearing_i} 1/m_d
+        # The sum runs ONLY over docs that CONTAIN the gold answer; the denominator
+        # stays |D_i| = ALL retrieved docs. Rationale: under the all-docs numerator,
+        # answer-bearing docs are retrieved by most pool members (high m_d → low
+        # 1/m_d) while junk docs are rare (low m_d → high 1/m_d), so maximizing R_div
+        # pushed the policy AWAY from the evidence it needs. Restricting the numerator
+        # to gold-bearing docs makes the only way to raise R_div "reach the answer via
+        # a doc few siblings found". Keeping |D_i| in the denominator still charges for
+        # padding the trajectory with junk. m_d is unchanged (counted over all pool
+        # docs) — gold-bearing is a property of the doc, so m_d for a gold-bearing doc
+        # is identical either way.
+        self.div_gold_only = bool(div_gold_only)
+        # div_gold_watch: parse the per-rollout gold-bearing doc sets PURELY for the
+        # div/gold_* diagnostics, on arms whose reward does not need them (GRPO,
+        # DIVER, batch). Costs one extra decode+regex pass over the observation
+        # chunks per rollout, so it is opt-in; gold-aware arms get it for free.
+        self.div_gold_watch = bool(div_gold_watch)
         # evidence containment 판정 캐시: (prompt_hash, doc identity) -> bool.
         # 같은 질문의 G개 rollout 이 같은 문서를 자주 회수하므로 적중률이 높다.
         self._evd_cache = {}
@@ -355,12 +375,12 @@ class RewardManager():
             chunk_ids = response_token_ids[s:e]
             chunk_text = self.tokenizer.decode(chunk_ids)
             matches = re.findall(
-                r'Doc \d+\(Title: "([^"]+)"\)(.*?)(?=Doc \d+\(Title:|\Z)',
+                r'Doc \d+\(Title: ("?)([^"\n]*?)\1\)(.*?)(?=Doc \d+\(Title:|\Z)',
                 chunk_text,
                 re.DOTALL,
             )
             docs = set()
-            for title, content in matches:
+            for _q, title, content in matches:
                 content_norm = ' '.join(content.split())
                 content_hash = hashlib.md5(content_norm.encode('utf-8')).hexdigest()
                 docs.add((title, content_hash))
@@ -457,10 +477,10 @@ class RewardManager():
         for s, e in obs_chunks:
             chunk_text = self.tokenizer.decode(response_token_ids[s:e])
             matches = re.findall(
-                r'Doc \d+\(Title: "([^"]+)"\)(.*?)(?=Doc \d+\(Title:|\Z)',
+                r'Doc \d+\(Title: ("?)([^"\n]*?)\1\)(.*?)(?=Doc \d+\(Title:|\Z)',
                 chunk_text, re.DOTALL)
             docs = set()
-            for title, content in matches:
+            for _q, title, content in matches:
                 content_norm = ' '.join(content.split())
                 ident = (title, hashlib.md5(content_norm.encode('utf-8')).hexdigest())
                 docs.add(ident)
@@ -533,11 +553,11 @@ class RewardManager():
         for s, e in obs_chunks:
             chunk_text = self.tokenizer.decode(response_token_ids[s:e])
             matches = re.findall(
-                r'Doc \d+\(Title: "([^"]+)"\)(.*?)(?=Doc \d+\(Title:|\Z)',
+                r'Doc \d+\(Title: ("?)([^"\n]*?)\1\)(.*?)(?=Doc \d+\(Title:|\Z)',
                 chunk_text,
                 re.DOTALL,
             )
-            for title, content in matches:
+            for _q, title, content in matches:
                 content_norm = ' '.join(content.split())
                 cn = qa_em_format.normalize_answer(content_norm)
                 if any(gn in cn for gn in golds_norm):
@@ -607,6 +627,45 @@ class RewardManager():
         if in_gen:
             chunks.append((start, len(response_info_mask)))
         return chunks
+
+    # Format-reward weight for _acc_fmt_reward (Jin et al. 2025, arXiv:2505.15117
+    # Eq.3 lambda_f). The paper grid-searched {0.2, 0.4, 0.6, 0.8} and picked 0.2
+    # for 3B, which is what this uses.
+    LAMBDA_FMT = 0.2
+
+    def _acc_fmt_reward(self, r_acc, r_fmt):
+        """Four-quadrant EM x format reward (Jin et al. 2025 Eq.3), lambda_f = 0.1:
+
+            correct + format ok   -> 1.0
+            correct + format bad  -> 1 - lambda_f = 0.9
+            wrong   + format ok   -> lambda_f     = 0.1
+            wrong   + format bad  -> 0.0
+
+        Replaces the earlier additive R_acc + R_fmt, whose {0,1,1,2} spacing is
+        equivalent to lambda_f = 0.5 under GRPO's std normalization — i.e. it rated
+        a well-formed wrong answer exactly as high as a badly-formed correct one.
+        use_format_reward=False collapses this to plain EM.
+        """
+        if not self.use_format_reward:
+            return r_acc
+        if r_acc > 0:
+            return 1.0 if r_fmt > 0 else 1.0 - self.LAMBDA_FMT
+        return self.LAMBDA_FMT if r_fmt > 0 else 0.0
+
+    def _policy_only_text(self, response_token_ids, response_info_mask):
+        """Decode ONLY the model-generated spans (info_mask==1), joined by a space.
+
+        Same identity rule as _extract_docs_per_step: what the environment injected
+        is info_mask==0, everything the policy emitted is info_mask==1. A regex over
+        the decoded string cannot make that distinction — it also strips
+        <information> blocks the MODEL fabricated (which are policy tokens and must
+        stay), and an unclosed model-side <information> pairs with the environment's
+        next </information>, swallowing the model's own think/search in between.
+        """
+        parts = []
+        for s, e in self._find_all_gen_chunks(response_info_mask):
+            parts.append(self.tokenizer.decode(response_token_ids[s:e]))
+        return ' '.join(parts)
 
     # ------------------------------------------------------------------
     # Reasoning-embedding diversity helpers (new ablation arm)
@@ -1104,14 +1163,14 @@ class RewardManager():
     # (handles internal parens like "Beauty and the Beast (1991 film)") and make
     # the "Content:" label OPTIONAL so BOTH formats parse.
     _V2_DOC_RE = re.compile(
-        r'Doc\s*\d+\s*\(Title:\s*"([^"]*)"\)\s*(?:\n?\s*Content:\s*)?(.*?)(?=Doc\s*\d+\s*\(Title:|\Z)',
+        r'Doc\s*\d+\s*\(Title:\s*("?)([^"\n]*?)\1\)\s*(?:\n?\s*Content:\s*)?(.*?)(?=Doc\s*\d+\s*\(Title:|\Z)',
         re.DOTALL)
 
     @classmethod
     def _v2_parse_docs(cls, em_seq):
         out, seen = [], set()
         for blk in cls._V2_INFO_RE.findall(em_seq or ""):
-            for title, content in cls._V2_DOC_RE.findall(blk):
+            for _q, title, content in cls._V2_DOC_RE.findall(blk):
                 title, content = title.strip(), " ".join(content.split())
                 key = content[:200]
                 if content and key not in seen:
@@ -1127,7 +1186,7 @@ class RewardManager():
         out, seen = [], set()
         for blk in cls._V2_INFO_RE.findall(em_seq or ""):
             unit = []
-            for title, content in cls._V2_DOC_RE.findall(blk):
+            for _q, title, content in cls._V2_DOC_RE.findall(blk):
                 title, content = title.strip(), " ".join(content.split())
                 key = content[:200]
                 if content and key not in seen:
@@ -1198,7 +1257,7 @@ class RewardManager():
         Same doc re-fetched later = one player (dedup by key, keep first occurrence)."""
         out, seen = [], set()
         for blk in cls._V2_INFO_RE.findall(em_seq or ""):
-            for title, content in cls._V2_DOC_RE.findall(blk):
+            for _q, title, content in cls._V2_DOC_RE.findall(blk):
                 title = title.strip()
                 content = " ".join(content.split())
                 if not content:
@@ -1439,7 +1498,7 @@ class RewardManager():
         bp = 1.0 if c > r else math.exp(1.0 - r / c)   # c>0 guaranteed above
         return bp * math.exp(log_p)
 
-    def _bleu_diversity(self, strata, response_strs, base_scores, bs):
+    def _bleu_diversity(self, strata, policy_strs, base_scores, bs):
         """DIVER Textual Diversity (Hu et al. 2026, arXiv:2509.26209) as a baseline
         R_div, replacing doc-novelty with text-novelty:
             TD(o_i) = (1/(|G|-1)) Σ_{j∈G, j≠i} (1 − BLEU(o_i, o_j))
@@ -1447,15 +1506,14 @@ class RewardManager():
         FULL-group d(o_i) of DIVER §3.4; application stays accuracy-gated downstream
         (DIVER's Conditional Shaping I(r_i), done in the placement loop). TD is then
         clipped to [0, σ] (Balanced Shaping, DIVER §3.5; σ=self.bleu_sigma, paper 0.65).
-        Text = the model-generated response with retrieved <information>…</information>
-        stripped (the policy did not emit it and it is state-masked in the loss). The
-        final <answer> is KEPT — same as DIVER, where every correct response ends in
-        the same \\boxed{} answer, so a constant-answer floor is part of the baseline."""
-        INFO_RE = re.compile(r'<information>.*?</information>', re.DOTALL)
+        `policy_strs` already holds POLICY-ONLY text — the caller built it from
+        info_mask==1 spans (_policy_only_text), so env-injected observations are gone
+        and model-fabricated <information> is kept. The final <answer> is KEPT — same
+        as DIVER, where every correct response ends in the same \\boxed{} answer, so a
+        constant-answer floor is part of the baseline."""
         toks = []
         for i in range(bs):
-            t = INFO_RE.sub(' ', response_strs[i] or '')
-            toks.append(t.lower().split())
+            toks.append((policy_strs[i] or '').lower().split())
         out = {i: 0.0 for i in range(bs)}
         for ph, idxs in strata.items():
             if len(idxs) < 2:
@@ -1610,7 +1668,11 @@ class RewardManager():
                     doc_count[d] += 1
             for i in pool:
                 if traj_docs[i]:
-                    novelty = sum(1.0 / doc_count[d] for d in traj_docs[i])
+                    # div_gold_only: numerator restricted to answer-bearing docs;
+                    # denominator below stays |D_i| (ALL retrieved docs), so junk
+                    # padding still dilutes. Empty intersection -> novelty 0.
+                    num_docs = (traj_docs[i] & _gbd[i]) if self.div_gold_only else traj_docs[i]
+                    novelty = sum(1.0 / doc_count[d] for d in num_docs)
                     if self.div_capped:
                         out[i] = novelty / max(len(traj_docs[i]), self.div_topk)
                     elif self.div_sum_mode:
@@ -1844,6 +1906,63 @@ class RewardManager():
             'jaccard': (sum(jac) / len(jac)) if jac else float('nan'),
             'n_jac_groups': len(jac),
             'uniq': (sum(uniq) / len(uniq)) if uniq else float('nan'),
+        }
+
+    def _gold_watch(self, strata, gold_bearing_docs, per_step_docs_all):
+        """Per-group GOLD spread: how many DISTINCT gold-bearing docs a group's rollouts
+        collectively retrieve (union), against how many a single rollout carries.
+        Answers "does the group reach the answer through DIFFERENT evidence, or does
+        every rollout land on the SAME gold doc?" — which _div_watch's uniq/jaccard
+        cannot, since those count junk docs too: a group can diversify its padding
+        while its gold doc stays fixed, and the two metrics would not tell you.
+            uniq_g   = |union of (D_i & Gold_i) over i in g|   (0 if the group found none)
+            per_traj = |D_i & Gold_i|, over gold-HOLDING rollouts only
+            jaccard  = mean pairwise J over gold-holding rollouts (groups with >=2)
+        uniq_hit > per_traj  =>  siblings hold different gold docs.
+        uniq_hit == per_traj =>  every gold-holder holds the identical gold doc set.
+        Gold detection + doc identity are _gold_bearing_docs' (per-doc, content-level
+        EM-normalized containment), so these sets are subsets of the doc sets
+        _div_watch counts. Rollouts that never retrieved cannot hold gold and are
+        dropped from per_traj/jaccard, but their group still counts in grp_frac's
+        denominator. Over ALL rollouts of a group (not just the R_div pool), matching
+        _div_watch, so it stays comparable on arms that pay no diversity. Purely
+        diagnostic: nothing computed here enters any reward."""
+        def _mean(v):
+            return (sum(v) / len(v)) if v else float('nan')
+        uniq, per_traj, jac = [], [], []
+        n_groups = n_groups_gold = n_traj = n_traj_gold = 0
+        for idxs in strata.values():
+            n_groups += 1
+            searched = [i for i in idxs if per_step_docs_all[i]]
+            n_traj += len(searched)
+            sets = [gold_bearing_docs[i] for i in searched if gold_bearing_docs[i]]
+            n_traj_gold += len(sets)
+            u = set()
+            for s in sets:
+                u |= s
+            uniq.append(len(u))
+            if sets:
+                n_groups_gold += 1
+                per_traj.extend(len(s) for s in sets)
+            if len(sets) >= 2:
+                tot = cnt = 0
+                for a in range(len(sets)):
+                    for b in range(a + 1, len(sets)):
+                        un = len(sets[a] | sets[b])
+                        if un:
+                            tot += len(sets[a] & sets[b]) / un
+                            cnt += 1
+                if cnt:
+                    jac.append(tot / cnt)
+        return {
+            'uniq': _mean(uniq),                          # gold-less groups counted as 0
+            'uniq_hit': _mean([u for u in uniq if u]),    # gold-holding groups only
+            'per_traj': _mean(per_traj),
+            'jaccard': _mean(jac),
+            'n_jac_groups': len(jac),
+            'traj_frac': (n_traj_gold / n_traj) if n_traj else float('nan'),
+            'grp_frac': (n_groups_gold / n_groups) if n_groups else float('nan'),
+            'n_groups': n_groups, 'n_traj': n_traj,
         }
 
     def _v2_shapley_div(self, strata, em_seqs, golds_all, base_scores,
@@ -2090,6 +2209,7 @@ class RewardManager():
         gold_bearing_docs_all = [] # per-rollout set of gold-bearing (title,hash) — for gold-share canary
         data_sources_all = []   # per-rollout data_source (for budget-gated diversity)
         response_strs = []      # per-rollout decoded model response (for BLEU TD baseline)
+        policy_strs = []        # same, but POLICY-ONLY (info_mask==1 spans) — BLEU TD input
         outcome_answers = []    # per-rollout normalized final answer (for batch_outcome exploration)
         step_ranges_all = []
         # Final <think>...<answer> chunk span per trajectory (the model-gen chunk
@@ -2164,6 +2284,7 @@ class RewardManager():
                 fmt_scores.append(0.0)
                 em_seqs.append(None)
 
+            resp_info_mask = None
             if has_info_mask and self.diversity_type in ('evidence_exempt',
                                                          'evidence_doc_exempt',
                                                          'gq_doc_exempt'):
@@ -2227,7 +2348,8 @@ class RewardManager():
 
             # gold-bearing docs: which of the rollout's retrieved docs CONTAIN the gold
             # answer (EM-norm, per-doc). gold_in = holds >=1. Only for budget_ungate_gold.
-            if has_info_mask and self.budget_ungate_gold:
+            if has_info_mask and (self.budget_ungate_gold or self.div_gold_only
+                                  or self.div_gold_watch):
                 _golds = ground_truth['target'] if isinstance(ground_truth, dict) else ground_truth
                 if isinstance(_golds, str):
                     _golds = [_golds]
@@ -2246,6 +2368,15 @@ class RewardManager():
             gold_bearing_docs_all.append(gbset)
             data_sources_all.append(data_source)
             response_strs.append(response_str)
+            # BLEU TD input: policy-only text. info_mask is the authority; the regex
+            # is only a fallback for runs whose batch carries no info_mask at all.
+            if resp_info_mask is not None:
+                policy_strs.append(
+                    self._policy_only_text(valid_response_ids, resp_info_mask))
+            else:
+                policy_strs.append(
+                    re.sub(r'<information>.*?</information>', ' ',
+                           response_str or '', flags=re.DOTALL))
             step_ranges_all.append(ranges)
             answer_ranges_all.append(answer_range)
 
@@ -2505,8 +2636,8 @@ class RewardManager():
             for i in range(bs):
                 valid_len = valid_response_lengths[i]
                 if valid_len > 0:
-                    r_fmt = fmt_scores[i] if self.use_format_reward else 0.0   # format 0/1 (toggleable)
-                    outcome_tensor[i, valid_len - 1] = base_scores[i] + r_fmt
+                    outcome_tensor[i, valid_len - 1] = self._acc_fmt_reward(
+                        base_scores[i], fmt_scores[i])
             data.meta_info['batch_outcome'] = list(outcome_answers)
             data.meta_info['batch_acc'] = [float(base_scores[i]) for i in range(bs)]  # R_acc, for all-correct zeroing
             for i in range(bs):
@@ -2655,13 +2786,13 @@ class RewardManager():
                     elif base_scores[i] <= 0:
                         div_dbg[i] = "(wrong, no div: over-budget or mixed group)"
                     else:
-                        div_dbg[i] = "(budget 0: over-budget)"
+                        div_dbg[i] = "(R_div 0: over-budget/no-docs/no-gold)"
             elif self.diversity_type == 'bleu' and self.lambda_div > 0:
                 # --- DIVER Textual Diversity baseline (BLEU dissimilarity over the
                 #   prompt group): R_div_i = (1/(|G|-1)) Σ_{j≠i}(1 − BLEU(o_i,o_j)),
                 #   measured over ALL rollouts, applied to correct only (gate below).
                 #   Replaces doc-novelty with text-novelty. See _bleu_diversity. ---
-                bl = self._bleu_diversity(strata, response_strs, base_scores, bs)
+                bl = self._bleu_diversity(strata, policy_strs, base_scores, bs)
                 for i in range(bs):
                     traj_div_scores[i] = bl.get(i, 0.0)
                     if base_scores[i] <= 0:
@@ -2788,10 +2919,11 @@ class RewardManager():
                             div_dbg[i] = f"(soft-nov {r_div:.2f}/{len(docs_i)}d corr-pool)"
                             traj_div_log.append(r_div)
 
-            # --- Place R_total = R_acc + R_fmt + 1[acc]·λ·R_div at the last token ---
+            # --- Place R_total = _acc_fmt_reward(R_acc, R_fmt) + 1[acc]·λ·R_div ---
             for i in range(bs):
-                r_acc = base_scores[i]              # EM 0/1
-                r_fmt = fmt_scores[i] if self.use_format_reward else 0.0   # format 0/1 (toggleable)
+                r_acc = base_scores[i]              # EM 0/1, also gates the diversity term
+                r_fmt = fmt_scores[i]               # format 0/1
+                r_base = self._acc_fmt_reward(r_acc, r_fmt)
                 r_div = traj_div_scores[i]
                 if self.diversity_type == 'budget':
                     # asymmetric gate already applied in _budget_soft_diversity (pool
@@ -2802,7 +2934,7 @@ class RewardManager():
                     div_add = lam * r_div
                 else:
                     div_add = lam * r_div if r_acc > 0 else 0.0   # accuracy-gated
-                r_total = r_acc + r_fmt + div_add
+                r_total = r_base + div_add
                 valid_len = valid_response_lengths[i]
                 if valid_len > 0:
                     outcome_tensor[i, valid_len - 1] = r_total
@@ -2812,7 +2944,8 @@ class RewardManager():
                 # print this path bypasses. Shows the reward breakdown.
                 if self.num_examine == 0 and random.randint(1, 64) == 1:
                     print("-------------------------------- [em_fmt_doc sample]")
-                    print(f"R_acc={r_acc:.0f} R_fmt={r_fmt:.0f} R_div={r_div:.3f} {div_dbg[i]} "
+                    print(f"R_acc={r_acc:.0f} R_fmt={r_fmt:.0f} R_base={r_base:.2f} "
+                          f"R_div={r_div:.3f} {div_dbg[i]} "
                           f"| gate={'on' if div_add > 0 else 'off'} lambda={lam:.3g} "
                           f"=> R_total={r_total:.3f}")
                     print(f"Solution string: {em_seqs[i]}")
@@ -3185,7 +3318,7 @@ class RewardManager():
             fmt_arr = np.array(fmt_scores)
             corr = base_arr > 0
             rc = {
-                'reward/r_acc': float(base_arr.mean()),               # = accuracy
+                'reward/r_acc': float(base_arr.mean()),               # = accuracy (EM)
                 'reward/r_fmt': float(fmt_arr.mean()),                # format pass rate
             }
             # Soft-novelty (the Proposed value) measured for EVERY arm — independent of
@@ -3195,6 +3328,35 @@ class RewardManager():
                 strata, per_step_docs_all, base_scores, bs))
             rc['reward/soft_nov_all'] = float(sn_arr.mean())
             rc['reward/soft_nov_correct'] = float(sn_arr[corr].mean()) if corr.any() else 0.0
+            # div-watch: search count / budget utilisation / within-group doc overlap.
+            # Reward-agnostic (needs only strata + retrieved docs), so logged for EVERY
+            # arm — same rationale as soft-novelty above. Keeps search behaviour
+            # comparable head-to-head across em_fmt_doc / batch_outcome / passk runs.
+            _dw = self._div_watch(strata, per_step_docs_all, data_sources_all, bs)
+            rc['div/searches_B1'] = _dw['b_mean'].get(1, float('nan'))
+            rc['div/searches_B2'] = _dw['b_mean'].get(2, float('nan'))
+            rc['div/group_jaccard'] = _dw['jaccard']
+            rc['div/group_unique_docs'] = _dw['uniq']
+            rc['div/budget_full_B1'] = _dw['b_full'].get(1, float('nan'))
+            rc['div/budget_full_B2'] = _dw['b_full'].get(2, float('nan'))
+            # gold-spread: DISTINCT gold-bearing docs a group collectively retrieves.
+            # Needs the per-rollout gold sets, which are only parsed when a gold-aware
+            # arm asked for them (or +div_gold_watch=true forced the extra pass).
+            if self.budget_ungate_gold or self.div_gold_only or self.div_gold_watch:
+                _gw = self._gold_watch(strata, gold_bearing_docs_all, per_step_docs_all)
+                rc['div/gold_uniq'] = _gw['uniq']
+                rc['div/gold_uniq_hit'] = _gw['uniq_hit']
+                rc['div/gold_per_traj'] = _gw['per_traj']
+                rc['div/gold_jaccard'] = _gw['jaccard']
+                rc['div/gold_traj_frac'] = _gw['traj_frac']
+                rc['div/gold_grp_frac'] = _gw['grp_frac']
+            # diff@N: mean number of DISTINCT answers per prompt group (the quantity
+            # Batch exploration optimizes). Also reward-agnostic -> every arm.
+            _distinct = []
+            for ph, idxs in strata.items():
+                answs = [outcome_answers[i] for i in idxs if outcome_answers[i] is not None]
+                _distinct.append(len(set(answs)))
+            rc['reward/distinct_answers_per_group'] = float(np.mean(_distinct)) if _distinct else 0.0
             if self.combine_mode == 'em_fmt_doc':
                 div_arr = np.array(traj_div_scores)
                 rc['reward/r_div_all'] = float(div_arr.mean())
@@ -3208,14 +3370,6 @@ class RewardManager():
                 _gs = getattr(self, '_budget_gold_share', None)
                 if self.budget_ungate_gold and _gs is not None and _gs['den'] > 0:
                     rc['reward/gold_share'] = float(_gs['share'])
-                # --- div-watch (see the block printed after Search-count distribution) ---
-                _dw = self._div_watch(strata, per_step_docs_all, data_sources_all, bs)
-                rc['div/searches_B1'] = _dw['b_mean'].get(1, float('nan'))
-                rc['div/searches_B2'] = _dw['b_mean'].get(2, float('nan'))
-                rc['div/group_jaccard'] = _dw['jaccard']
-                rc['div/group_unique_docs'] = _dw['uniq']
-                rc['div/budget_full_B1'] = _dw['b_full'].get(1, float('nan'))
-                rc['div/budget_full_B2'] = _dw['b_full'].get(2, float('nan'))
                 _rd = getattr(self, '_div_rdiv_dist', None)
                 if _rd is not None:
                     rc['div/rdiv_mean'] = _rd['mean']
@@ -3234,15 +3388,6 @@ class RewardManager():
                     rc['div/docs_nogold'] = _pg['docs_nogold']
                     rc['div/search_gold'] = _pg['search_gold']
                     rc['div/search_nogold'] = _pg['search_nogold']
-            if self.combine_mode == 'batch_outcome':
-                # diff@N: mean number of DISTINCT answers per prompt group (the
-                # quantity Batch exploration optimizes). Higher = more answer
-                # diversity within the batch.
-                _distinct = []
-                for ph, idxs in strata.items():
-                    answs = [outcome_answers[i] for i in idxs if outcome_answers[i] is not None]
-                    _distinct.append(len(set(answs)))
-                rc['reward/distinct_answers_per_group'] = float(np.mean(_distinct)) if _distinct else 0.0
             # passk merges reward_components AND passk_acc/passk_fmt — keep both.
             data.meta_info['reward_components'] = rc
 
@@ -3367,6 +3512,15 @@ class RewardManager():
                       f"search={_pg['search_gold']:.2f}  vs  no-gold |D|={_pg['docs_nogold']:.2f} "
                       f"search={_pg['search_nogold']:.2f}"
                       f"   ← gold 쪽 search가 낮으면 '일찍 찾고 멈춤' 가설 참")
+            if self.budget_ungate_gold or self.div_gold_only or self.div_gold_watch:
+                _gw = self._gold_watch(strata, gold_bearing_docs_all, per_step_docs_all)
+                print(f"    (2c) gold spread     : uniq/group={_gw['uniq']:.2f} "
+                      f"(gold 보유 그룹만 {_gw['uniq_hit']:.2f}) vs per-traj={_gw['per_traj']:.2f} "
+                      f"| gold jaccard={_gw['jaccard']:.3f} (n={_gw['n_jac_groups']})"
+                      f"   ← uniq_hit > per-traj 면 서로 다른 gold 문서를 물어오는 중")
+                print(f"    (2d) gold 보유율    : traj {_gw['traj_frac']*100:.1f}% "
+                      f"| group {_gw['grp_frac']*100:.1f}% "
+                      f"(groups={_gw['n_groups']}, searched traj={_gw['n_traj']})")
             _rd = getattr(self, '_div_rdiv_dist', None)
             if _rd is not None:
                 print(f"    (6) R_div dist (paid) : mean={_rd['mean']:.4f} std={_rd['std']:.4f} "
@@ -3633,6 +3787,8 @@ def main_task(config):
     _dlm = config.get('div_lambda_map', None)                       # e.g. +div_lambda_map.nq=0.3333
     div_lambda_map = dict(_dlm) if _dlm else None                   # None → {nq: 1/3, hotpotqa: 1/6}
     div_off_all_correct = bool(config.get('div_off_all_correct', False))  # zero R_div on all-correct groups
+    div_gold_only = bool(config.get('div_gold_only', False))  # R_div numerator over gold-BEARING docs only (denominator stays |D_i|)
+    div_gold_watch = bool(config.get('div_gold_watch', False))  # log div/gold_* on gold-agnostic arms (costs one extra decode pass/rollout)
     use_format_reward = bool(config.get('use_format_reward', True))  # em_fmt_doc: include R_fmt in R_total
     bleu_sigma = float(config.get('bleu_sigma', 0.65))  # diversity_type='bleu': DIVER Balanced-Shaping clip(TD;0,σ)
     guesser_gate = bool(config.get('guesser_gate', True))    # False: evidence 계열 E' 자격 게이트 해제 (pool=E, count 도 E 기준)
@@ -3683,6 +3839,8 @@ def main_task(config):
         div_lambda_map=div_lambda_map,
         div_lambda_default=div_lambda_default,
         div_off_all_correct=div_off_all_correct,
+        div_gold_only=div_gold_only,
+        div_gold_watch=div_gold_watch,
         use_format_reward=use_format_reward,
         bleu_sigma=bleu_sigma,
         guesser_gate=guesser_gate,

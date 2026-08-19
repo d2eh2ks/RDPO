@@ -487,7 +487,15 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         #   A_i       = GRPO_adv_i + c · b_batch_i        (faithful Eq.2; b NOT /σ)
         # Same base reward as adv_estimator='grpo' (apples-to-apples vs the proposed
         # run). NOT correct-gated — diverse answers on unsolved questions is the point.
-        # An unparseable answer (None) never matches any sibling → contributes 0.
+        # An unparseable answer (None) is ONE degenerate outcome: None == None, so such
+        # rollouts penalise each other like any other repeated answer. The alternative
+        # (exempting them) would make "emit no answer" the one way to dodge the
+        # repetition penalty. The paper is silent here and its code is unreleased.
+        # NB: the all-correct zeroing of §3.2 is NOT applied here. The paper scopes it
+        # to UCB-Mean/UCB-Con ("for both UCB-Mean and UCB-Con"); §3.3 introduces Batch
+        # without inheriting it, so applying it would be a deviation. Consequence: on an
+        # all-correct group the base advantage is 0 and b_batch ≤ 0 is the only signal,
+        # so those rollouts take a uniform negative push. That is the paper's behaviour.
         token_level_rewards = data.batch['token_level_rewards']
         index = data.non_tensor_batch['uid']
         responses = data.batch['responses']
@@ -497,7 +505,6 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         base_adv, _ = core_algos.compute_grpo_outcome_advantage(
             token_level_rewards=token_level_rewards, eos_mask=response_mask, index=index)
         outcomes = data.meta_info['batch_outcome']
-        accs = data.meta_info.get('batch_acc', None)   # R_acc per rollout (for all-correct zeroing)
         bs = responses.size(0)
         uid2idx = defaultdict(list)
         for i in range(bs):
@@ -507,16 +514,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             N = len(idxs)
             if N < 2:
                 continue
-            if accs is not None and all(accs[i] > 0 for i in idxs):
-                # All-correct group: base GRPO advantage is 0 (constant reward), so the
-                # always-≤0 batch penalty would dominate and push DOWN the correct
-                # answers just for repeating. Zero the bonus -> recover plain GRPO on
-                # this group (Song et al. 2025, arXiv:2509.06941, §3.2).
-                continue
             for i in idxs:
                 ai = outcomes[i]
-                if ai is None:
-                    continue
                 same = sum(1 for j in idxs if j != i and outcomes[j] == ai)
                 bonus[i] = -(1.0 / N) * same
         bonus_t = torch.tensor(bonus, dtype=torch.float32,

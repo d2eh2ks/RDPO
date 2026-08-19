@@ -1,10 +1,5 @@
 import os
 os.environ["VLLM_WORKER_MULTIPROC_METHOD"] = "spawn"
-# HF 캐시를 쓰기 가능한 곳으로. 홈의 ~/.cache/huggingface 는 root 소유라
-# trust_remote_code=True 경로의 init_hf_modules() 가 modules/ 를 못 만들고 죽는다.
-# transformers 가 HF_MODULES_CACHE 를 import 시점에 확정하므로 반드시
-# transformers/vllm import 보다 먼저 설정해야 한다. 학습 스크립트와 같은 경로.
-os.environ.setdefault("HF_HOME", "/data/huggingface")
 
 import re
 import json
@@ -20,9 +15,9 @@ import requests
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
-MODEL_PATH  = "/data/dongwan/verl_checkpoints/DIVER-3B/actor/global_step_100"
-DATA_DIR    = "/localhome/dial/dongwan/Search-R1/test_data"
-OUTPUT_DIR  = "/localhome/dial/dongwan/Search-R1/test_results"
+MODEL_PATH  = "/shared/models/dongwan/verl_checkpoints/GRPO-3B/actor/global_step_200"
+DATA_DIR    = "test_data"
+OUTPUT_DIR  = "test_results"
 
 N_SAMPLES   = 64
 PASS_KS     = [1, 2, 4, 8, 16, 32, 64]
@@ -37,12 +32,20 @@ MAX_TURNS      = 4
 MAX_NEW_TOKENS = 1024
 TOP_K          = 3
 RETRIEVAL_URL  = "http://127.0.0.1:8000/retrieve"
+INVALID_OBS    = ("\nMy previous action is invalid. "
+                  "If I want to search, I should put the query between <search> and </search>. "
+                  "If I want to give the final answer, I should put the answer between <answer> "
+                  "and </answer>. Let me try again.\n")
 
-def parse_contents(contents):
-    lines = contents.strip().split("\n", 1)
-    title = lines[0].strip('"') if lines else ""
-    text  = lines[1].strip() if len(lines) > 1 else ""
-    return title, text
+def passages2string(items):
+    out = ""
+    for idx, item in enumerate(items):
+        doc = item["document"] if isinstance(item, dict) and "document" in item else item
+        content = doc.get("contents", "")
+        title = content.split("\n")[0]
+        text = "\n".join(content.split("\n")[1:])
+        out += f"Doc {idx+1}(Title: {title}) {text}\n"
+    return out
 
 class WikiSearchEngine:
     def __init__(self, url=RETRIEVAL_URL, timeout=300, max_retries=8):
@@ -73,15 +76,7 @@ class WikiSearchEngine:
         else:
             raise RuntimeError(f"search_batch failed after {self.max_retries} retries: {last_err}")
 
-        out = []
-        for items in result:
-            buf = ""
-            for i, item in enumerate(items):
-                doc = item["document"] if isinstance(item, dict) and "document" in item else item
-                title, text = parse_contents(doc.get("contents", ""))
-                buf += f'Doc {i+1} (Title: "{title}")\nContent: {text}\n\n'
-            out.append(buf or "No relevant documents found.")
-        return out
+        return [passages2string(items) for items in result]
 
 def make_prompt(question, tokenizer):
     base = (
@@ -153,7 +148,7 @@ def worker(gpu_id, tasks, result_queue, cfg):
     for t in tasks:
         p = make_prompt(t["question"], tokenizer)
         states.append({"task": t, "context": p, "prompt_len": len(p),
-                       "answer": "", "step": 0, "finished": False})
+                       "answer": "", "step": 0, "invalid": 0, "finished": False})
 
     t0, done, total = time.time(), 0, len(states)
     while True:
@@ -180,13 +175,16 @@ def worker(gpu_id, tasks, result_queue, cfg):
             if sq and states[i]["step"] <= max_turns:
                 search_queries.append(sq)
                 search_targets.append(i)
-            else:
+            elif states[i]["step"] > max_turns:
                 states[i]["finished"] = True
                 finished_now.append(i)
+            else:
+                states[i]["context"] += INVALID_OBS
+                states[i]["invalid"] += 1
 
         if search_queries:
             for i, res in zip(search_targets, wiki.search_batch(search_queries, k=TOP_K)):
-                states[i]["context"] += f"\n\n<information>\n{res}</information>\n\n"
+                states[i]["context"] += f"\n\n<information>{res.strip()}</information>\n\n"
 
         for i in finished_now:
             t = states[i]["task"]
@@ -200,6 +198,7 @@ def worker(gpu_id, tasks, result_queue, cfg):
                 "correct":        correct,
                 "golden_answers": t["golden_answers"],
                 "retrieved":      traj.count("<information>"),
+                "invalid":        states[i]["invalid"],
                 "trajectory":     traj,
             })
             states[i]["context"] = ""
@@ -235,10 +234,11 @@ def generate(samples_per_ds, model_path, gpu_ids, batch_size, n_samples,
              temperature, max_turns, out_dir, gpu_mem_util):
     os.makedirs(out_dir, exist_ok=True)
     ds_paths = {ds: os.path.join(out_dir, f"{ds}.jsonl") for ds in samples_per_ds}
-    expected = sum(len(s) for s in samples_per_ds.values()) * n_samples
 
-    raw = []
-    for ds, p in ds_paths.items():
+    raw, todo = [], []
+    for ds, samples in samples_per_ds.items():
+        p = ds_paths[ds]
+        rows, seen = [], set()
         if os.path.exists(p) and os.path.getsize(p) > 0:
             with open(p, "r", encoding="utf-8") as f:
                 for line in f:
@@ -249,14 +249,21 @@ def generate(samples_per_ds, model_path, gpu_ids, batch_size, n_samples,
                         r = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    raw.append((r["dataset"], r["id"], int(r.get("correct", 0))))
-    if len(raw) >= expected:
-        print(f"  resume: {len(raw)} rollouts on disk -> recompute pass@k only")
+                    seen.add((r["id"], r.get("sample_idx")))
+                    rows.append((r["dataset"], r["id"], int(r.get("correct", 0))))
+        if len(seen) >= len(samples) * n_samples:
+            print(f"  skip {ds}: {len(rows)} rollouts on disk")
+            raw.extend(rows)
+        else:
+            if seen:
+                print(f"  redo {ds}: {len(seen)}/{len(samples) * n_samples} rollouts on disk")
+            todo.append(ds)
+    if not todo:
         return raw
 
     tasks = []
-    for ds, samples in samples_per_ds.items():
-        for s in samples:
+    for ds in todo:
+        for s in samples_per_ds[ds]:
             for j in range(n_samples):
                 tasks.append({**s, "sample_idx": j})
     shards = [[] for _ in gpu_ids]
@@ -276,8 +283,7 @@ def generate(samples_per_ds, model_path, gpu_ids, batch_size, n_samples,
         p.start()
         procs.append(p)
 
-    handles = {ds: open(p, "w", encoding="utf-8") for ds, p in ds_paths.items()}
-    raw = []
+    handles = {ds: open(ds_paths[ds], "w", encoding="utf-8") for ds in todo}
     done_workers = 0
     while done_workers < len(procs):
         r = q.get()
@@ -378,7 +384,7 @@ def main():
 
     model_path = args.model_path.rstrip("/")
     if not os.path.isdir(model_path):
-        raise SystemExit(f"[error] no checkpoint dir: {model_path}")
+        raise SystemExit(f"no checkpoint dir: {model_path}")
 
     step_name = os.path.basename(model_path)
     parent = os.path.dirname(model_path)
@@ -393,11 +399,12 @@ def main():
     gpu_ids = [int(x) for x in args.gpu_ids.split(",") if x.strip()]
 
     data_dir = args.data_dir.rstrip("/")
-    present = {os.path.splitext(os.path.basename(p))[0] for p in glob.glob(os.path.join(data_dir, "*.jsonl"))}
+    present = {os.path.splitext(os.path.basename(p))[0]
+               for p in glob.glob(os.path.join(data_dir, "*.jsonl"))}
     order = DATASET_ORDER if args.datasets is None else list(args.datasets)
     datasets = [d for d in order if d in present]
     if not datasets:
-        raise SystemExit(f"[error] no test datasets found in {data_dir}")
+        raise SystemExit(f"no test datasets found in {data_dir}")
 
     samples_per_ds = {ds: load_dataset(ds, data_dir) for ds in datasets}
     total_q = sum(len(s) for s in samples_per_ds.values())

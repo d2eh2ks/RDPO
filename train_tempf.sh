@@ -1,5 +1,5 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export DATA_DIR=/data/dongwan/nq_hotpotqa_train_gq
+export DATA_DIR=/shared/models/dongwan/nq_hotpotqa_train_gq
 export TRAIN_DATA_DIR=$DATA_DIR
 export TEST_DATA_DIR=$DATA_DIR
 
@@ -9,13 +9,17 @@ export BASE_MODEL='Qwen/Qwen2.5-3B'
 export EXPERIMENT_NAME=TempH-3B
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export RAY_TMPDIR=/data/dongwan/ray_tmp
-export TMPDIR=/data/dongwan/ray_tmp
-export WANDB_DIR=/data/dongwan/wandb
-export WANDB_CACHE_DIR=/data/dongwan/wandb_cache
-export HF_HOME=/data/huggingface
+export RAY_TMPDIR=/shared/models/dongwan/ray_tmp
+export TMPDIR=/shared/models/dongwan/ray_tmp
+export WANDB_DIR=/shared/models/dongwan/wandb
+export WANDB_CACHE_DIR=/shared/models/dongwan/wandb_cache
+export HF_HOME=/shared/models/hf-dial
 export NCCL_P2P_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# triton/inductor JIT 이 -lcuda 로 링크하는데 /lib/x86_64-linux-gnu 에는 libcuda.so.1 만
+# 있고 unversioned libcuda.so 가 없어서 ld 가 실패한다. CUDA stub 을 링크 경로에 추가.
+# stub 의 SONAME 이 libcuda.so.1 이라 런타임엔 실제 드라이버가 로드된다.
+export LIBRARY_PATH=/usr/lib/x86_64-linux-gnu/stubs${LIBRARY_PATH:+:$LIBRARY_PATH}
 
 PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.train_files=$TRAIN_DATA_DIR/train.parquet \
@@ -65,17 +69,17 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.total_epochs=15 \
     trainer.total_training_steps=201 \
-    trainer.default_local_dir=/data/dongwan/verl_checkpoints/$EXPERIMENT_NAME \
+    trainer.default_local_dir=/shared/models/dongwan/verl_checkpoints/$EXPERIMENT_NAME \
     max_turns=4 \
     retriever.url="http://127.0.0.1:8000/retrieve" \
     retriever.topk=3 \
     +diversity_type=gq_doc_exempt \
-    +gq_path_nq=/data/dongwan/nq_gq_train_strict.pkl \
-    +gq_path_hotpotqa=/data/dongwan/hqa_gq_train_doc.pkl \
+    +gq_path_nq=/shared/models/dongwan/nq_gq_train_strict.pkl \
+    +gq_path_hotpotqa=/shared/models/dongwan/hqa_gq_train_doc.pkl \
     +combine_mode=em_fmt_doc \
     +lambda_div=1.0 \
     +budget_default=2 \
     +budget_lone_pool=true \
     +grpo_std_floor=0.086958 \
     +use_format_reward=false \
-    2>&1 | tee /data/dongwan/$EXPERIMENT_NAME.log
+    2>&1 | tee /shared/models/dongwan/logs/$EXPERIMENT_NAME.log
