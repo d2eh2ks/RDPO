@@ -286,7 +286,7 @@ class RewardManager():
                                   'search_embedding', 'v2_shapley', 'v1_filtered',
                                   'meaningful', 'rgsn', 'budget', 'evidence_exempt',
                                   'evidence_doc_exempt', 'gq_doc_exempt',
-                                  'bleu', 'none'), \
+                                  'bleu', 'gold_cov', 'gold_cov_all', 'none'), \
             f"Unknown diversity_type: {diversity_type}"
         self.diversity_type = diversity_type
         # --- 오프라인 G_q (diversity_type='gq_doc_exempt') ---
@@ -514,12 +514,14 @@ class RewardManager():
         return per_step, evd_exempt, evd_eligible
 
     def _gold_bearing_docs(self, response_token_ids, response_info_mask, golds):
-        """Set of (title, content_md5) doc identities whose CONTENT contains a gold
-        answer (EM-normalized substring). Doc identity + content normalization match
-        _extract_docs_per_step exactly, so the returned set is a subset of that
-        rollout's traj_docs (union of per_step_docs_all). Per-DOC (not concatenated)
-        so a gold can't spuriously straddle two docs. Uses info_mask (not text-tag
-        matching), robust to the model fabricating <information> tags. Used for
+        """Set of (title, content_md5) doc identities whose TEXT (Title + content)
+        contains a gold answer (EM-normalized, word-boundary match). Doc identity
+        (title, content_md5) matches _extract_docs_per_step, so same-title but
+        different-chunk docs are DISTINCT (content_md5 differs). Match is per-DOC
+        over the whole doc text (title AND content) so a gold appearing only in the
+        title still counts; word-boundary so short golds don't match inside longer
+        words (gold "cat" ∌ "category"). Uses info_mask (not text-tag matching),
+        robust to the model fabricating <information> tags. Used for
         (a) budget_ungate_gold pool membership (rollout eligible iff it holds >=1
         gold-bearing doc) and (b) the gold-share junk-padding canary."""
         if golds is None:
@@ -559,8 +561,17 @@ class RewardManager():
             )
             for _q, title, content in matches:
                 content_norm = ' '.join(content.split())
-                cn = qa_em_format.normalize_answer(content_norm)
-                if any(gn in cn for gn in golds_norm):
+                # Match the gold against the WHOLE doc text (Title + content), so a
+                # gold that appears only in the title still counts. Identity/dedup
+                # stays content-based (content_md5), independent of the match text.
+                doc_text = (title + ' ' + content_norm) if title else content_norm
+                cn = qa_em_format.normalize_answer(doc_text)
+                # Word-boundary match (not raw substring): a normalized gold must
+                # appear as a whole token span, so short answers no longer spuriously
+                # match inside longer words (gold "cat" must NOT match "category").
+                # normalize_answer already strips punctuation/lowercases, so \b sits
+                # on space bounds.
+                if any(re.search(r'\b' + re.escape(gn) + r'\b', cn) for gn in golds_norm):
                     content_hash = hashlib.md5(content_norm.encode('utf-8')).hexdigest()
                     bearing.add((title, content_hash))
         return bearing
@@ -2349,7 +2360,8 @@ class RewardManager():
             # gold-bearing docs: which of the rollout's retrieved docs CONTAIN the gold
             # answer (EM-norm, per-doc). gold_in = holds >=1. Only for budget_ungate_gold.
             if has_info_mask and (self.budget_ungate_gold or self.div_gold_only
-                                  or self.div_gold_watch):
+                                  or self.div_gold_watch
+                                  or self.diversity_type in ('gold_cov', 'gold_cov_all')):
                 _golds = ground_truth['target'] if isinstance(ground_truth, dict) else ground_truth
                 if isinstance(_golds, str):
                     _golds = [_golds]
@@ -2802,6 +2814,54 @@ class RewardManager():
                         div_dbg[i] = f"(bleu-td {traj_div_scores[i]:.3f})"
                     else:
                         div_dbg[i] = "(bleu-td 0)"
+            elif self.diversity_type in ('gold_cov', 'gold_cov_all') and self.lambda_div > 0:
+                # --- OURS: per-rollout gold(answer)-doc coverage SHARE (Σ_i R_div_i = 1) ---
+                #   Per prompt group, over the CORRECT rollouts:
+                #     D        = ∪_{j∈correct} gold_bearing_docs_all[j]   (distinct gold docs)
+                #     count(d) = #{j∈correct : d ∈ gold_bearing_docs_all[j]}
+                #   Each correct rollout i is scored on its OWN gold docs D_i, but
+                #   NORMALIZED by the GROUP total |D| (NOT |D_i|) so the shares sum to 1:
+                #     R_div_i = (1/|D|) · Σ_{d∈D_i} 1/count(d)
+                #   Σ_{i∈correct} R_div_i = 1 exactly: each doc d contributes
+                #   count(d)·(1/count(d))/|D| = 1/|D|, summed over |D| docs → 1.
+                #   R_div_i DIFFERS per rollout (D_i differs). Wrong rollouts → 0
+                #   (also gated at placement; λ=1 here). A rollout's share is HIGH
+                #   when it covers many gold docs that FEW other correct rollouts hold.
+                #   gold_bearing_docs_all[i] = set of (title, content_hash) docs held
+                #   by rollout i whose CONTENT contains the gold answer (_gold_bearing_docs).
+                #   'gold_cov_all' widens the pool from the CORRECT rollouts to ALL
+                #   rollouts of the group (correct AND wrong): D, count(d) and the shares
+                #   are all computed over every rollout, and the 1[correct] gate at
+                #   placement is lifted so a wrong rollout that reached a gold doc few
+                #   siblings hold still gets paid. Formula, |D| normalization and Σ_i
+                #   R_div_i = 1 are unchanged — only the pool differs.
+                _all_pool = (self.diversity_type == 'gold_cov_all')
+                for ph, idxs in strata.items():
+                    correct_idx = list(idxs) if _all_pool \
+                        else [i for i in idxs if base_scores[i] > 0]
+                    doc_count = defaultdict(int)   # count(d) over the pool
+                    D = set()                      # distinct gold docs of the group
+                    for j in correct_idx:
+                        gdocs = gold_bearing_docs_all[j]
+                        D |= gdocs
+                        for d in gdocs:
+                            doc_count[d] += 1
+                    nD = len(D)
+                    for i in idxs:
+                        if not _all_pool and base_scores[i] <= 0:
+                            traj_div_scores[i] = 0.0
+                            div_dbg[i] = "(wrong)"
+                            continue
+                        D_i = gold_bearing_docs_all[i]
+                        if not D_i or nD == 0:
+                            traj_div_scores[i] = 0.0
+                            div_dbg[i] = "(no gold doc)"
+                            traj_div_log.append(0.0)
+                            continue
+                        r_div = sum(1.0 / doc_count[d] for d in D_i) / nD
+                        traj_div_scores[i] = r_div
+                        div_dbg[i] = f"(gold-cov {r_div:.3f} |D_i|={len(D_i)}/|D|={nD})"
+                        traj_div_log.append(r_div)
             elif self.diversity_type in ('v2_shapley', 'v1_filtered') and self.lambda_div > 0:
                 # --- v2 (Shapley) / v1 (article 1/m): SAME Stage-0 scorer + Stage-1
                 # filter; only the Stage-2 credit rule differs. Clean head-to-head of
@@ -2931,6 +2991,13 @@ class RewardManager():
                     # carry R_div. Do NOT re-gate on 1[correct] here — that would zero
                     # exactly the ungated wrong-pool payments. r_div is already 0 for
                     # any rollout outside its group's pool.
+                    div_add = lam * r_div
+                elif self.diversity_type == 'gold_cov_all':
+                    # gold_cov_all: R_div is a share over ALL rollouts of the group, so
+                    # the 1[correct] gate is lifted here too — otherwise the wrong
+                    # rollouts' shares would be computed and then thrown away, and Σ_i
+                    # (paid R_div) would no longer be 1. r_div is already 0 for any
+                    # rollout holding no gold-bearing doc.
                     div_add = lam * r_div
                 else:
                     div_add = lam * r_div if r_acc > 0 else 0.0   # accuracy-gated
@@ -3342,7 +3409,8 @@ class RewardManager():
             # gold-spread: DISTINCT gold-bearing docs a group collectively retrieves.
             # Needs the per-rollout gold sets, which are only parsed when a gold-aware
             # arm asked for them (or +div_gold_watch=true forced the extra pass).
-            if self.budget_ungate_gold or self.div_gold_only or self.div_gold_watch:
+            if (self.budget_ungate_gold or self.div_gold_only or self.div_gold_watch
+                    or self.diversity_type in ('gold_cov', 'gold_cov_all')):
                 _gw = self._gold_watch(strata, gold_bearing_docs_all, per_step_docs_all)
                 rc['div/gold_uniq'] = _gw['uniq']
                 rc['div/gold_uniq_hit'] = _gw['uniq_hit']
@@ -3512,7 +3580,8 @@ class RewardManager():
                       f"search={_pg['search_gold']:.2f}  vs  no-gold |D|={_pg['docs_nogold']:.2f} "
                       f"search={_pg['search_nogold']:.2f}"
                       f"   ← gold 쪽 search가 낮으면 '일찍 찾고 멈춤' 가설 참")
-            if self.budget_ungate_gold or self.div_gold_only or self.div_gold_watch:
+            if (self.budget_ungate_gold or self.div_gold_only or self.div_gold_watch
+                    or self.diversity_type in ('gold_cov', 'gold_cov_all')):
                 _gw = self._gold_watch(strata, gold_bearing_docs_all, per_step_docs_all)
                 print(f"    (2c) gold spread     : uniq/group={_gw['uniq']:.2f} "
                       f"(gold 보유 그룹만 {_gw['uniq_hit']:.2f}) vs per-traj={_gw['per_traj']:.2f} "

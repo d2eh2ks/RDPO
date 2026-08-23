@@ -20,7 +20,7 @@ import requests
 from transformers import AutoTokenizer
 from vllm import LLM, SamplingParams
 
-MODEL_PATH  = "/shared/models/dongwan/verl_checkpoints/GRPO-3B/actor/global_step_200"
+MODEL_PATH  = "/home/dongwan/models/verl_checkpoints/DIVER-3B/actor/global_step_200"
 DATA_DIR    = "test_data"
 OUTPUT_DIR  = "test_results"
 

@@ -487,10 +487,14 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
         #   A_i       = GRPO_adv_i + c · b_batch_i        (faithful Eq.2; b NOT /σ)
         # Same base reward as adv_estimator='grpo' (apples-to-apples vs the proposed
         # run). NOT correct-gated — diverse answers on unsolved questions is the point.
-        # An unparseable answer (None) is ONE degenerate outcome: None == None, so such
-        # rollouts penalise each other like any other repeated answer. The alternative
-        # (exempting them) would make "emit no answer" the one way to dodge the
-        # repetition penalty. The paper is silent here and its code is unreleased.
+        # An unparseable answer (None) matches NOTHING — not even another None — so
+        # parse-failure rollouts neither take nor cause a repetition penalty. This
+        # follows the paper's own equality primitive (§2.1: answer equivalence via
+        # math_verify, whose verify(parse(unparseable), parse(unparseable)) is False —
+        # checked empirically), so counting None==None was the deviation. It also cuts
+        # the observed failure loop: degrading generation -> more Nones -> mutual
+        # None-penalties push the policy further down (the first Batch-3B run died at
+        # step 73 with the whole batch at the uniform -0.16 = c*(N-1)/N penalty).
         # NB: the all-correct zeroing of §3.2 is NOT applied here. The paper scopes it
         # to UCB-Mean/UCB-Con ("for both UCB-Mean and UCB-Con"); §3.3 introduces Batch
         # without inheriting it, so applying it would be a deviation. Consequence: on an
@@ -516,6 +520,8 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                 continue
             for i in idxs:
                 ai = outcomes[i]
+                if ai is None:
+                    continue    # parse failure: matches nothing, no penalty (bonus 0)
                 same = sum(1 for j in idxs if j != i and outcomes[j] == ai)
                 bonus[i] = -(1.0 / N) * same
         bonus_t = torch.tensor(bonus, dtype=torch.float32,
@@ -1371,8 +1377,24 @@ class RayPPOTrainer(object):
                         # compute advantages, executed on the driver process.
                         # lambda_div (cur_lambda_div) and per_group_constraint were
                         # resolved before the reward fn via _compute_lambda_div.
+                        # --- Pass@k -> Pass@1 two-stage schedule in ONE run (paper §3.5) ---
+                        # +passk_switch_step=S : steps 1..S use the configured estimator
+                        # (grpo_passk), every step after falls back to plain 'grpo'. The
+                        # reward is untouched — combine_mode='passk' already writes R_acc
+                        # (EM) at the last token, which is exactly what 'grpo' normalizes,
+                        # so both stages optimize the SAME R_total = R_acc and only the
+                        # advantage transform changes. Safe at runtime: 'grpo' and
+                        # 'grpo_passk' both map to use_critic=False (see ~line 1065), so no
+                        # worker/critic reconfiguration is implied. 0 (default) = disabled.
+                        _adv_est = self.config.algorithm.adv_estimator
+                        _passk_switch = int(self.config.get('passk_switch_step', 0))
+                        if _passk_switch > 0:
+                            _stage2 = self.global_steps > _passk_switch
+                            if _stage2:
+                                _adv_est = 'grpo'
+                            metrics['actor/passk_stage'] = 2.0 if _stage2 else 1.0
                         batch = compute_advantage(batch,
-                                                  adv_estimator=self.config.algorithm.adv_estimator,
+                                                  adv_estimator=_adv_est,
                                                   gamma=self.config.algorithm.gamma,
                                                   lam=self.config.algorithm.lam,
                                                   num_repeat=self.config.actor_rollout_ref.rollout.n,

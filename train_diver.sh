@@ -1,18 +1,18 @@
 export CUDA_VISIBLE_DEVICES=0,1,2,3
-export DATA_DIR=/shared/datasets/search-r1/nq_hotpotqa_train
-export TRAIN_DATA_DIR=/shared/models/dongwan/datasets/nq_hotpotqa_train
+export DATA_DIR=/home/dongwan/datasets/search-r1/nq_hotpotqa_train
+export TRAIN_DATA_DIR=/home/dongwan/models/datasets/nq_hotpotqa_train
 export TEST_DATA_DIR=$DATA_DIR
 
-WAND_PROJECT='Final-3B'
+WAND_PROJECT='Trial1-3B'
 
 export BASE_MODEL='Qwen/Qwen2.5-3B'
-export EXPERIMENT_NAME=DIVERA-3B
+export EXPERIMENT_NAME=DIVER-3B
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
-export RAY_TMPDIR=/shared/models/dongwan/ray_tmp
-export TMPDIR=/shared/models/dongwan/ray_tmp
-export WANDB_DIR=/shared/models/dongwan/wandb
-export WANDB_CACHE_DIR=/shared/models/dongwan/wandb_cache
+export RAY_TMPDIR=/home/dongwan/models/ray_tmp
+export TMPDIR=/home/dongwan/models/ray_tmp
+export WANDB_DIR=/home/dongwan/models/wandb
+export WANDB_CACHE_DIR=/home/dongwan/models/wandb_cache
 export HF_HOME=/shared/models/hf-dial
 export NCCL_P2P_DISABLE=1
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
@@ -24,7 +24,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     data.val_files=$TEST_DATA_DIR/test.parquet \
     data.train_data_num=null \
     data.val_data_num=null \
-    data.train_batch_size=32 \
+    data.train_batch_size=64 \
     data.val_batch_size=256 \
     data.max_prompt_length=6656 \
     data.max_response_length=512 \
@@ -40,7 +40,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.use_kl_loss=true \
     actor_rollout_ref.actor.kl_loss_coef=0.001 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
-    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=32 \
     actor_rollout_ref.actor.ppo_micro_batch_size=16 \
     actor_rollout_ref.actor.fsdp_config.param_offload=True \
     actor_rollout_ref.actor.fsdp_config.grad_offload=True \
@@ -67,7 +67,7 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.total_epochs=15 \
     trainer.total_training_steps=201 \
-    trainer.default_local_dir=/shared/models/dongwan/verl_checkpoints/$EXPERIMENT_NAME \
+    trainer.default_local_dir=/home/dongwan/models/verl_checkpoints/$EXPERIMENT_NAME \
     max_turns=4 \
     retriever.url="http://127.0.0.1:8000/retrieve" \
     retriever.topk=3 \
@@ -82,4 +82,4 @@ PYTHONUNBUFFERED=1 python3 -m verl.trainer.main_ppo \
     +budget_default=2 \
     +budget_lone_pool=true \
     +use_format_reward=false \
-    2>&1 | tee /shared/models/dongwan/logs/$EXPERIMENT_NAME.log
+    2>&1 | tee /home/dongwan/models/logs/$EXPERIMENT_NAME.log
