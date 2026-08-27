@@ -393,10 +393,18 @@ class LLMGenerationManager:
                     valid_action.append(1)
                     is_search.append(1)
                 else:
-                    next_obs.append(f'\nMy previous action is invalid. \
-If I want to search, I should put the query between <search> and </search>. \
-If I want to give the final answer, I should put the answer between <answer> and </answer>. Let me try again.\n')
-                    dones.append(0)
+                    # 원본: invalid 턴마다 형식 안내문을 관측으로 주입하고 dones=0으로
+                    # 롤아웃을 계속 돌렸다 — 형식을 못 맞춘 롤아웃에 사실상 재시도를
+                    # 면제로 주는 셈이었다.
+                    #   '\nMy previous action is invalid. If I want to search, I should put
+                    #    the query between <search> and </search>. If I want to give the final
+                    #    answer, I should put the answer between <answer> and </answer>.
+                    #    Let me try again.\n'
+                    # 지금은 안내문 없이 dones=1로 그 자리에서 롤아웃을 끝낸다. 한 턴 안에
+                    # <search>/<answer> 중 하나를 못 내면 재시도 없음. <answer>가 없으니
+                    # extract_solution -> None -> R_acc = 0.
+                    next_obs.append('')
+                    dones.append(1)
                     valid_action.append(0)
                     is_search.append(0)
             

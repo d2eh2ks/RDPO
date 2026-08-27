@@ -257,7 +257,7 @@ class RewardManager():
         #               A_i = A_passk_i + (R_fmt_i − group_mean(R_fmt)).
         #             RewardManager here only computes/stashes R_acc and R_fmt.
         assert combine_mode in ('post_norm', 'pre_norm', 'step_reward', 'em_fmt_doc', 'passk',
-                                'batch_outcome'), \
+                                'batch_outcome', 'edas'), \
             f"Unknown combine_mode: {combine_mode}"
         self.combine_mode = combine_mode
 
@@ -2268,7 +2268,7 @@ class RewardManager():
 
             ground_truth = data_item.non_tensor_batch['reward_model']['ground_truth']
             data_source = data_item.non_tensor_batch['data_source']
-            if self.combine_mode in ('em_fmt_doc', 'passk', 'batch_outcome'):
+            if self.combine_mode in ('em_fmt_doc', 'passk', 'batch_outcome', 'edas'):
                 # Decompose the reward into independent EM and FORMAT components
                 # (the v0.3 graded reward couples them; here we need them separate).
                 # extract_solution returns None unless there are >= 2 <answer> tags
@@ -2633,6 +2633,36 @@ class RewardManager():
                     print(f"R_acc={base_scores[i]:.0f} R_fmt={fmt_scores[i]:.0f} "
                           f"R_total={base_scores[i]+fmt_scores[i]:.0f} "
                           f"(advantage analytic downstream per passk_reward_mode)")
+                    print(f"Solution string: {em_seqs[i]}")
+        elif self.combine_mode == 'edas':
+            # ===== EDAS (Liu et al. 2026, arXiv:2605.17333) =====
+            # EDAS touches NOTHING in the reward pipeline — it is a post-hoc adjustment
+            # on the advantages of INCORRECT trajectories only (§3: "EDAS modifies only
+            # the advantage values assigned to incorrect trajectories; correct
+            # trajectories and the rest of the training pipeline remain untouched").
+            # So the reward here is exactly train_grpo.sh's: R_total = R_acc (+ R_fmt if
+            # use_format_reward). Appendix F.2: "the correctness of the final answer
+            # served as the sole source of the reward signal" — so run with
+            # use_format_reward=false to match.
+            # What we stash is the per-rollout error LABEL for the equivalence function
+            # E(y_i) of §3.1. The paper's math instantiation is "the canonicalized
+            # numerical answer from \boxed{}, symbolically normalized via Math-Ruler";
+            # the QA analogue here is extract_solution + normalize_answer (the SAME
+            # EM-normalized answer identity used elsewhere), which is what
+            # outcome_answers already holds. Appendix H rules out embedding-based
+            # grouping as a substitute, so a symbolic label is required.
+            for i in range(bs):
+                valid_len = valid_response_lengths[i]
+                if valid_len > 0:
+                    outcome_tensor[i, valid_len - 1] = self._acc_fmt_reward(
+                        base_scores[i], fmt_scores[i])
+            data.meta_info['edas_outcome'] = list(outcome_answers)   # E(y_i); None = unparseable
+            data.meta_info['edas_acc'] = [float(base_scores[i]) for i in range(bs)]
+            for i in range(bs):
+                if self.num_examine == 0 and random.randint(1, 64) == 1:
+                    print("-------------------------------- [edas sample]")
+                    print(f"R_acc={base_scores[i]:.0f} R_fmt={fmt_scores[i]:.0f} "
+                          f"E(y)={outcome_answers[i]!r} (EDAS delta applied at advantage)")
                     print(f"Solution string: {em_seqs[i]}")
         elif self.combine_mode == 'batch_outcome':
             # ===== Outcome-based Batch Exploration (Song et al. 2025, arXiv:2509.06941) =====
@@ -3381,7 +3411,7 @@ class RewardManager():
 
         # Expose the reward decomposition to the trainer → wandb (em_fmt_doc only).
         # The trainer merges data.meta_info['reward_components'] into its metrics.
-        if self.combine_mode in ('em_fmt_doc', 'passk', 'batch_outcome'):
+        if self.combine_mode in ('em_fmt_doc', 'passk', 'batch_outcome', 'edas'):
             fmt_arr = np.array(fmt_scores)
             corr = base_arr > 0
             rc = {

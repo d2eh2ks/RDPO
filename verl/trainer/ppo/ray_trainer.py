@@ -26,6 +26,7 @@ from typing import Type, Dict
 
 import re
 import json
+import math
 from collections import defaultdict
 
 import numpy as np
@@ -123,7 +124,8 @@ def apply_kl_penalty(data: DataProto, kl_ctrl: core_algos.AdaptiveKLController, 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, lambda_div=0.0,
                       per_group_constraint=False, passk_k=2, passk_fmt_weight=1.0,
                       passk_reward_mode='joint_binary', batch_explore_c=0.2,
-                      allwrong_adv_scale=False, allcorrect_center_only=False, grpo_std_floor=0.0):
+                      allwrong_adv_scale=False, allcorrect_center_only=False, grpo_std_floor=0.0,
+                      edas_alpha=0.4, edas_beta=0.2, edas_kappa=2.0, edas_none_mode='same'):
     # prepare response group
     # TODO: add other ways to estimate advantages
     if adv_estimator == 'gae':
@@ -476,6 +478,150 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
                         + passk_fmt_weight * (fmt[i] - fmt_mean)
 
         advantages = torch.tensor(adv_per, dtype=torch.float32,
+                                  device=responses.device).unsqueeze(-1) * response_mask
+        data.batch['advantages'] = advantages
+        data.batch['returns'] = advantages
+    elif adv_estimator == 'grpo_edas':
+        # ===== Error Diversity Advantage Shaping (Liu et al. 2026, arXiv:2605.17333) =====
+        # Post-hoc adjustment on the advantages of INCORRECT rollouts only; correct
+        # rollouts are returned untouched (§3). Per PROMPT GROUP (the paper's "group" =
+        # the n rollouts of one prompt), with W = incorrect subset and N_w = |W|:
+        #
+        #   S   = (1/N_w) Σ_{i∈W} |A_orig_i|                                   (Eq.1)
+        #   E   : partition W into K classes by canonicalized final answer      (§3.1)
+        #   p_k = |C_k|/N_w ,  I_i = −ln p_k ,  H = −Σ_k p_k ln p_k
+        #
+        #            ⎧ 0,                          N_w ≤ 1        (A: insufficient stats)
+        #   Δ_i   =  ⎨ −β·S,                       N_w>1, K = 1   (B: error perseveration)
+        #            ⎩ α·S·(I_i − H)/ln N_w,       K > 1          (C: healthy diversity)
+        #                                                                       (Eq.2)
+        #   A_final_i = A_orig_i + sgn(Δ_i)·min(|Δ_i|, |A_orig_i|/κ)            (Eq.3)
+        #
+        # Paper defaults α=0.4, β=0.2, κ=2.0 (§4.1, and identical for code in F.2).
+        #
+        # Two structural guarantees, both load-bearing for using this as a baseline here:
+        #  (1) Δ ∝ S = mean|A_orig| over W. On an all-correct group W is empty (Branch A)
+        #      and on an all-wrong group every score is equal, so GRPO's σ=0 makes every
+        #      A_orig 0 → S=0 → Δ=0. EDAS can NEVER inject signal where GRPO has none.
+        #      (This is why the paper recommends DAPO Dynamic Sampling, Appendix B — it
+        #      filters all-wrong groups instead. We have no dynamic sampling, so those
+        #      groups are simply inert rather than mis-signed.)
+        #  (2) κ-clipping bounds |Δ| ≤ |A_orig|/κ, so with A_orig<0 on every wrong rollout
+        #      A_final ∈ [A_orig(1+1/κ), A_orig(1−1/κ)] — at κ=2, within [1.5×, 0.5×] of
+        #      the GRPO advantage, and never sign-inverted (Appendix B, Thm B.1).
+        #  Contrast with grpo_batch, whose bonus is un-normalized and additive, so it can
+        #  (and did) dominate the base advantage once generation degraded.
+        #
+        # Zero-sum: Σ_{i∈W} T_i = 0 exactly (Appendix A), so Branch C is pure internal
+        # redistribution within the wrong subset. Branch B is deliberately NOT zero-sum —
+        # it is a uniform push away from a collapsed mode. Clipping may break the exact
+        # zero-sum at extremes; the paper calls that an intentional trade-off (Appendix A
+        # Remark).
+        #
+        # UNPARSEABLE ANSWERS (edas_none_mode): the paper's prose never states this, but
+        # its stated instantiation settles it. §3.1 fixes E as "the canonicalized
+        # numerical answer from the \boxed{} environment ... via the Math-Ruler library",
+        # and Math-Ruler's extract_boxed_content returns the literal STRING "None" when
+        # no \boxed{} is present — a concrete sentinel, not a null. Checked directly
+        # against mathruler 0.1.0:
+        #     extract_boxed_content('!!!!!!') -> 'None'   (str)
+        #     extract_boxed_content('')       -> 'None'
+        #     grade_answer('None', 'None')    -> True
+        # So under EDAS's own primitive two parse failures ARE co-classified: they share
+        # one error class. Hence 'same' is the faithful port.
+        #   'same'     (default) all unparseable rollouts form ONE class — matches
+        #              Math-Ruler's "None" sentinel. A fully answer-less group therefore
+        #              lands in Branch B (collapse penalty) rather than registering as
+        #              maximal diversity.
+        #   'distinct' each unparseable rollout is its own singleton class.
+        # NOTE this deliberately DIFFERS from grpo_batch, which uses the opposite rule.
+        # That is not an inconsistency: the two papers specify different equality
+        # primitives, and math_verify (Batch's, §2.1) makes verify(parse(unparseable),
+        # parse(unparseable)) False while Math-Ruler (EDAS's) makes it True. Each arm
+        # follows its own paper. Set 'distinct' only to force one shared convention
+        # across the two baselines, accepting the deviation from EDAS.
+        # Where the modes differ (N_w=4, one correct sibling): None×2+'x'×2 -> 'same'
+        # flattens to K=2-uniform and emits nothing while 'distinct' penalises the 'x'
+        # pair; None×3+'x'×1 reverses that. Identical whenever nothing is unparseable —
+        # measured on Batch-3B (Qwen2.5-3B-Instruct): 0 of 153 sampled rollouts.
+        token_level_rewards = data.batch['token_level_rewards']
+        index = data.non_tensor_batch['uid']
+        responses = data.batch['responses']
+        response_length = responses.size(-1)
+        attention_mask = data.batch['attention_mask']
+        response_mask = attention_mask[:, -response_length:]
+        base_adv, _ = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=token_level_rewards, eos_mask=response_mask, index=index)
+        outcomes = data.meta_info['edas_outcome']      # E(y_i), None if unparseable
+        accs = data.meta_info['edas_acc']              # R_acc 0/1
+        bs = responses.size(0)
+
+        # A_orig as a per-rollout scalar. compute_grpo_outcome_advantage broadcasts one
+        # scalar (r−mean)/std over the whole response, so the masked mean recovers it.
+        _den = response_mask.sum(-1).clamp(min=1)
+        a_orig = ((base_adv * response_mask).sum(-1) / _den).tolist()
+
+        uid2idx = defaultdict(list)
+        for i in range(bs):
+            uid2idx[index[i]].append(i)
+
+        delta = [0.0] * bs
+        _n_A = _n_B = _n_C = 0          # branch counts (groups)
+        _K_sum = _K_n = 0
+        for _uid, idxs in uid2idx.items():
+            W = [i for i in idxs if accs[i] <= 0]
+            Nw = len(W)
+            if Nw <= 1:
+                _n_A += 1
+                continue                                          # Branch A
+            S = sum(abs(a_orig[i]) for i in W) / Nw                # Eq.1
+            classes = defaultdict(list)
+            for i in W:
+                lab = outcomes[i]
+                if lab is None and edas_none_mode == 'distinct':
+                    classes[('__none__', i)].append(i)             # singleton class
+                else:
+                    classes[lab].append(i)                         # None -> one shared class
+            K = len(classes)
+            _K_sum += K
+            _K_n += 1
+            if K == 1:
+                _n_B += 1
+                for i in W:
+                    delta[i] = -edas_beta * S                      # Branch B
+            else:
+                _n_C += 1
+                H = 0.0
+                for c in classes.values():
+                    p = len(c) / Nw
+                    H -= p * math.log(p)
+                ln_Nw = math.log(Nw)                               # Nw >= 2 -> > 0
+                for c in classes.values():
+                    p = len(c) / Nw
+                    T = (-math.log(p) - H) / ln_Nw                 # in [-1, 1]
+                    for i in c:
+                        delta[i] = edas_alpha * S * T              # Branch C
+
+        # Eq.3 monotonicity-preserving clipping.
+        adv_final = [0.0] * bs
+        _clip_hits = 0
+        for i in range(bs):
+            d = delta[i]
+            if d == 0.0:
+                adv_final[i] = a_orig[i]
+                continue
+            cap = abs(a_orig[i]) / edas_kappa
+            if abs(d) > cap:
+                _clip_hits += 1
+            adv_final[i] = a_orig[i] + math.copysign(min(abs(d), cap), d)
+
+        data.meta_info['edas_stats'] = {
+            'branch_A': _n_A, 'branch_B': _n_B, 'branch_C': _n_C,
+            'mean_K': (_K_sum / _K_n) if _K_n else 0.0,
+            'clip_frac': (_clip_hits / max(sum(1 for d in delta if d != 0.0), 1)),
+            'mean_abs_delta': (sum(abs(d) for d in delta) / max(bs, 1)),
+        }
+        advantages = torch.tensor(adv_final, dtype=torch.float32,
                                   device=responses.device).unsqueeze(-1) * response_mask
         data.batch['advantages'] = advantages
         data.batch['returns'] = advantages
@@ -1062,7 +1208,7 @@ class RayPPOTrainer(object):
             self.resource_pool_to_cls[resource_pool]['critic'] = critic_cls
             self.use_critic = True
             
-        elif self.config.algorithm.adv_estimator in ('grpo', 'grpo_step_level', 'grpo_step_combined', 'grpo_passk', 'grpo_batch'):
+        elif self.config.algorithm.adv_estimator in ('grpo', 'grpo_step_level', 'grpo_step_combined', 'grpo_passk', 'grpo_batch', 'grpo_edas'):
             self.use_critic = False
         else:
             raise NotImplementedError
@@ -1406,7 +1552,19 @@ class RayPPOTrainer(object):
                                                   batch_explore_c=float(self.config.get('batch_explore_c', 0.2)),
                                                   allwrong_adv_scale=bool(self.config.get('allwrong_adv_scale', False)),
                                                   allcorrect_center_only=bool(self.config.get('allcorrect_center_only', False)),
-                                                  grpo_std_floor=float(self.config.get('grpo_std_floor', 0.0)))
+                                                  grpo_std_floor=float(self.config.get('grpo_std_floor', 0.0)),
+                                                  edas_alpha=float(self.config.get('edas_alpha', 0.4)),
+                                                  edas_beta=float(self.config.get('edas_beta', 0.2)),
+                                                  edas_kappa=float(self.config.get('edas_kappa', 2.0)),
+                                                  edas_none_mode=str(self.config.get('edas_none_mode', 'same')))
+                        _es = batch.meta_info.get('edas_stats')
+                        if _es is not None:
+                            metrics['edas/branch_A_groups'] = _es['branch_A']
+                            metrics['edas/branch_B_groups'] = _es['branch_B']
+                            metrics['edas/branch_C_groups'] = _es['branch_C']
+                            metrics['edas/mean_K'] = _es['mean_K']
+                            metrics['edas/clip_frac'] = _es['clip_frac']
+                            metrics['edas/mean_abs_delta'] = _es['mean_abs_delta']
                         _aws = batch.meta_info.get('allwrong_adv_scale_stats')
                         if _aws is not None:
                             metrics['actor/allwrong_adv_scale/c']        = _aws['c']
